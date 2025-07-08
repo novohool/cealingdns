@@ -1,0 +1,31 @@
+{
+  "general": {
+    "name": "Cealing DNS",
+    "predns": "10.66.231.99",
+    "adress": "0.0.0.0",
+    "port": 53
+  },
+  "sources": [
+    {
+      "name": "主规则源",
+      "type": "list",
+      "url": "https://gitlab.com/SpaceTimee/Cealing-Host/raw/main/Cealing-Host.json",
+      "enabled": true,
+      "comment": "核心域名映射规则"
+    }
+  ],
+  "rules": [
+    {
+      "type": "ip",
+      "ip": "127.0.0.1",
+      "domains": ["localhost", "local.dev"],
+      "comment": "本地开发环境映射"
+    },
+    {
+      "type": "ip",
+      "ip": "::1",
+      "domains": ["localhost6"],
+      "comment": "IPv6本地映射"
+    }
+  ]
+}
