@@ -1,7 +1,7 @@
 {
   "general": {
     "name": "Cealing DNS",
-    "predns": "10.66.231.99",
+    "predns": "114.114.114.114",
     "adress": "0.0.0.0",
     "port": 53
   },
