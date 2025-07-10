@@ -18,8 +18,15 @@ import (
 	"syscall"
 	"time"
 
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"math/big"
+
 	"github.com/miekg/dns"
-	"golang.org/x/crypto/acme/autocert"
 )
 
 // DNSRecord represents a DNS record
@@ -69,15 +76,15 @@ func (r *DNSRecord) Matches(queryDomain string) bool {
 // Config represents the configuration structure
 type Config struct {
 	General struct {
-		Name         string   `json:"name"`
-		Address      string   `json:"adress"` // Note: keeping original typo for compatibility
-		Port         int      `json:"port"`
-		PreDNS       string   `json:"predns"`
-		UpstreamDNS  []string `json:"upstream_dns"`
-		DohPort      int      `json:"doh_port"`
-		DohHTTPS     bool     `json:"doh_https"`
-		CertCacheDir string   `json:"cert_cache_dir"`
-		Domain       string   `json:"domain"`
+		Name        string   `json:"name"`
+		Address     string   `json:"adress"` // Note: keeping original typo for compatibility
+		Port        int      `json:"port"`
+		PreDNS      string   `json:"predns"`
+		UpstreamDNS []string `json:"upstream_dns"`
+		DohPort     int      `json:"doh_port"`
+		DohHTTPS    bool     `json:"doh_https"`
+		CertMode    string   `json:"cert_mode"`
+		Domain      string   `json:"domain"`
 	} `json:"general"`
 	Rules []struct {
 		Type    string   `json:"type"`
@@ -104,7 +111,6 @@ type DNSServer struct {
 	logger          *log.Logger
 	dohPort         int
 	dohHTTPS        bool
-	certCacheDir    string
 	domain          string
 }
 
@@ -657,8 +663,24 @@ func (s *DNSServer) StartDoH() error {
 	cfg := s.config.General
 	s.dohPort = cfg.DohPort
 	s.dohHTTPS = cfg.DohHTTPS
-	s.certCacheDir = cfg.CertCacheDir
 	s.domain = cfg.Domain
+	certMode := "auto"
+	if v, ok := any(cfg).(map[string]interface{}); ok {
+		if gm, ok := v["cert_mode"].(string); ok {
+			certMode = gm
+		}
+	} else {
+		// 兼容结构体
+		type generalWithCertMode struct {
+			CertMode string `json:"cert_mode"`
+		}
+		var gm generalWithCertMode
+		b, _ := json.Marshal(cfg)
+		_ = json.Unmarshal(b, &gm)
+		if gm.CertMode != "" {
+			certMode = gm.CertMode
+		}
+	}
 
 	if s.dohPort == 0 {
 		s.dohPort = 8080 // Default to 8080 if not set
@@ -667,22 +689,74 @@ func (s *DNSServer) StartDoH() error {
 	http.HandleFunc("/dns-query", s.handleDoHRequest)
 
 	if s.dohHTTPS {
-		manager := &autocert.Manager{
-			Cache:      autocert.DirCache(s.certCacheDir),
-			Prompt:     autocert.AcceptTOS,
-			HostPolicy: autocert.HostWhitelist(s.domain),
+		switch certMode {
+		case "auto", "self":
+			certFile := "doh_cert.pem"
+			keyFile := "doh_key.pem"
+			var cert, key []byte
+			if _, err := os.Stat(certFile); err == nil {
+				cert, _ = os.ReadFile(certFile)
+				key, _ = os.ReadFile(keyFile)
+				s.logger.Printf("检测到已有自签名证书，直接加载 %s", certFile)
+			} else {
+				cert, key, err = generateSelfSignedCert(s.domain)
+				if err != nil {
+					s.logger.Printf("Failed to generate self-signed cert: %v", err)
+					return err
+				}
+				_ = os.WriteFile(certFile, cert, 0644)
+				_ = os.WriteFile(keyFile, key, 0600)
+				s.logger.Printf("自签名证书已生成并保存为 %s，可导入浏览器信任", certFile)
+			}
+			tlsCert, err := tls.X509KeyPair(cert, key)
+			if err != nil {
+				s.logger.Printf("Failed to load generated cert: %v", err)
+				return err
+			}
+			tlsConfig := &tls.Config{Certificates: []tls.Certificate{tlsCert}}
+			server := &http.Server{
+				Addr:      fmt.Sprintf(":%d", s.dohPort),
+				Handler:   nil,
+				TLSConfig: tlsConfig,
+			}
+			s.logger.Printf("DoH HTTPS server started at https://%s/dns-query (self-signed)", fmt.Sprintf(":%d", s.dohPort))
+			return server.ListenAndServeTLS("", "")
+		case "proxy":
+			s.logger.Printf("[TODO] Proxy certificate mode not implemented yet.")
+			return fmt.Errorf("Proxy mode not implemented")
+		default:
+			s.logger.Printf("Unknown cert_mode: %s", certMode)
+			return fmt.Errorf("Unknown cert_mode: %s", certMode)
 		}
-		server := &http.Server{
-			Addr:      fmt.Sprintf(":%d", s.dohPort),
-			Handler:   nil,
-			TLSConfig: manager.TLSConfig(),
-		}
-		s.logger.Printf("DoH HTTPS server started at https://%s/dns-query", fmt.Sprintf(":%d", s.dohPort))
-		return server.ListenAndServeTLS("", "")
 	} else {
 		s.logger.Printf("DoH HTTP server started at http://%s/dns-query", fmt.Sprintf(":%d", s.dohPort))
 		return http.ListenAndServe(fmt.Sprintf(":%d", s.dohPort), nil)
 	}
+}
+
+// generateSelfSignedCert 生成内存自签名证书
+func generateSelfSignedCert(domain string) ([]byte, []byte, error) {
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return nil, nil, err
+	}
+	now := time.Now()
+	tmpl := x509.Certificate{
+		SerialNumber: big.NewInt(now.UnixNano()),
+		Subject:      pkix.Name{CommonName: domain},
+		NotBefore:    now.Add(-time.Hour),
+		NotAfter:     now.Add(365 * 24 * time.Hour),
+		KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		DNSNames:     []string{domain},
+	}
+	certDER, err := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, &priv.PublicKey, priv)
+	if err != nil {
+		return nil, nil, err
+	}
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(priv)})
+	return certPEM, keyPEM, nil
 }
 
 // Stop stops the DNS server
