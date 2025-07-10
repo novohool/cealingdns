@@ -5,8 +5,8 @@
     "adress": "0.0.0.0",
     "doh_port": 443,
     "doh_https": true,
-    "cert_cache_dir": "letsencrypt_cache",
-    "domain": "cealing.dns.com"
+    "cert_mode": "auto",
+    "domain": "localhost"
   },
   "sources": [
     {
