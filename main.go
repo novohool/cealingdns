@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -18,6 +19,7 @@ import (
 	"time"
 
 	"github.com/miekg/dns"
+	"golang.org/x/crypto/acme/autocert"
 )
 
 // DNSRecord represents a DNS record
@@ -31,6 +33,12 @@ type DNSRecord struct {
 
 // NewDNSRecord creates a new DNS record
 func NewDNSRecord(domain, ip, recordType string) *DNSRecord {
+	// 自动兼容 $*xxx 和 $xxx 写法
+	if strings.HasPrefix(domain, "$*") {
+		domain = "*" + domain[2:]
+	} else if strings.HasPrefix(domain, "$") {
+		domain = domain[1:]
+	}
 	record := &DNSRecord{
 		Domain:     strings.ToLower(domain),
 		IP:         ip,
@@ -61,11 +69,15 @@ func (r *DNSRecord) Matches(queryDomain string) bool {
 // Config represents the configuration structure
 type Config struct {
 	General struct {
-		Name        string   `json:"name"`
-		Address     string   `json:"adress"` // Note: keeping original typo for compatibility
-		Port        int      `json:"port"`
-		PreDNS      string   `json:"predns"`
-		UpstreamDNS []string `json:"upstream_dns"`
+		Name         string   `json:"name"`
+		Address      string   `json:"adress"` // Note: keeping original typo for compatibility
+		Port         int      `json:"port"`
+		PreDNS       string   `json:"predns"`
+		UpstreamDNS  []string `json:"upstream_dns"`
+		DohPort      int      `json:"doh_port"`
+		DohHTTPS     bool     `json:"doh_https"`
+		CertCacheDir string   `json:"cert_cache_dir"`
+		Domain       string   `json:"domain"`
 	} `json:"general"`
 	Rules []struct {
 		Type    string   `json:"type"`
@@ -90,6 +102,10 @@ type DNSServer struct {
 	running         bool
 	stopChan        chan struct{}
 	logger          *log.Logger
+	dohPort         int
+	dohHTTPS        bool
+	certCacheDir    string
+	domain          string
 }
 
 // NewDNSServer creates a new DNS server instance
@@ -399,6 +415,203 @@ func (s *DNSServer) handleDNSRequest(w dns.ResponseWriter, r *dns.Msg) {
 	w.WriteMsg(msg)
 }
 
+// handleDoHRequest handles DNS over HTTPS (DoH) requests
+func (s *DNSServer) handleDoHRequest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost && r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	var dnsQuery []byte
+	var origName string
+	var origType uint16 = 1
+	nameParam := ""
+	if r.Method == http.MethodPost {
+		if ct := r.Header.Get("Content-Type"); ct != "application/dns-message" {
+			w.WriteHeader(http.StatusUnsupportedMediaType)
+			return
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		dnsQuery = body
+	} else if r.Method == http.MethodGet {
+		dnsParam := r.URL.Query().Get("dns")
+		nameParam = r.URL.Query().Get("name")
+		if dnsParam != "" {
+			decoded, err := decodeBase64URL(dnsParam)
+			if err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			dnsQuery = decoded
+		} else if nameParam != "" {
+			domain := nameParam
+			typeParam := strings.ToUpper(r.URL.Query().Get("type"))
+			var qtype uint16 = 1 // 默认A
+			if typeParam == "AAAA" {
+				qtype = 28
+			}
+			msg := new(dns.Msg)
+			msg.SetQuestion(dns.Fqdn(domain), qtype)
+			wire, err := msg.Pack()
+			if err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			dnsQuery = wire
+			origName = dns.Fqdn(domain)
+			origType = qtype
+		} else {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+	}
+
+	msg := new(dns.Msg)
+	if err := msg.Unpack(dnsQuery); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	resp := s.doDoHQuery(msg, r.RemoteAddr)
+
+	// 检查是否要求返回 JSON
+	ctParam := r.URL.Query().Get("ct")
+	ctParam2 := r.URL.Query().Get("content-type")
+	// 默认: 只要是 GET 且有 name 参数，且未显式要求 wire format，就返回 JSON
+	wantJSON := false
+	if r.Method == http.MethodGet && nameParam != "" {
+		if ctParam == "" && ctParam2 == "" {
+			wantJSON = true
+		}
+	}
+	if ctParam == "application/dns-json" || ctParam2 == "application/dns-json" {
+		wantJSON = true
+	}
+	if ctParam == "application/dns-message" || ctParam2 == "application/dns-message" {
+		wantJSON = false
+	}
+
+	if wantJSON && (origName != "" || (len(resp.Question) > 0)) {
+		// 组装 Cloudflare 风格 JSON
+		qName := origName
+		qType := origType
+		if qName == "" && len(resp.Question) > 0 {
+			qName = resp.Question[0].Name
+			qType = resp.Question[0].Qtype
+		}
+		jsonResp := map[string]interface{}{
+			"Status": resp.Rcode,
+			"TC":     resp.Truncated,
+			"RD":     resp.RecursionDesired,
+			"RA":     resp.RecursionAvailable,
+			"AD":     resp.AuthenticatedData,
+			"CD":     resp.CheckingDisabled,
+			"Question": []map[string]interface{}{
+				{"name": qName, "type": qType},
+			},
+		}
+		// Answer
+		answers := []map[string]interface{}{}
+		for _, rr := range resp.Answer {
+			m := map[string]interface{}{
+				"name": rr.Header().Name,
+				"type": rr.Header().Rrtype,
+				"TTL":  rr.Header().Ttl,
+			}
+			switch v := rr.(type) {
+			case *dns.A:
+				m["data"] = v.A.String()
+			case *dns.AAAA:
+				m["data"] = v.AAAA.String()
+			case *dns.CNAME:
+				m["data"] = v.Target
+			default:
+				m["data"] = rr.String()
+			}
+			answers = append(answers, m)
+		}
+		jsonResp["Answer"] = answers
+		w.Header().Set("Content-Type", "application/dns-json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(jsonResp)
+		return
+	}
+
+	packed, err := resp.Pack()
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/dns-message")
+	w.WriteHeader(http.StatusOK)
+	w.Write(packed)
+}
+
+// doDoHQuery processes a DNS query and returns a response (for DoH)
+func (s *DNSServer) doDoHQuery(r *dns.Msg, remoteAddr string) *dns.Msg {
+	msg := &dns.Msg{}
+	msg.SetReply(r)
+
+	if len(r.Question) == 0 {
+		msg.Rcode = dns.RcodeFormatError
+		return msg
+	}
+
+	question := r.Question[0]
+	domain := strings.TrimSuffix(question.Name, ".")
+	qtype := question.Qtype
+
+	s.logger.Printf("DoH query: %s (%s) from %s", domain, dns.TypeToString[qtype], remoteAddr)
+
+	recordType := "A"
+	if qtype == dns.TypeAAAA {
+		recordType = "AAAA"
+	}
+
+	if record := s.findRecord(domain, recordType); record != nil {
+		s.logger.Printf("Local resolution: %s -> %s", domain, record.IP)
+		var rr dns.RR
+		var err error
+		if recordType == "A" {
+			rr, err = dns.NewRR(fmt.Sprintf("%s A %s", question.Name, record.IP))
+		} else {
+			rr, err = dns.NewRR(fmt.Sprintf("%s AAAA %s", question.Name, record.IP))
+		}
+		if err == nil {
+			msg.Answer = append(msg.Answer, rr)
+			return msg
+		}
+	}
+
+	answers := s.queryUpstream(domain, qtype)
+	if len(answers) > 0 {
+		s.logger.Printf("Upstream resolution: %s", domain)
+		msg.Answer = answers
+		return msg
+	}
+
+	s.logger.Printf("Resolution failed: %s", domain)
+	msg.Rcode = dns.RcodeNameError
+	return msg
+}
+
+// decodeBase64URL decodes base64url (RFC4648) string
+func decodeBase64URL(s string) ([]byte, error) {
+	// Add padding if needed
+	switch len(s) % 4 {
+	case 2:
+		s += "=="
+	case 3:
+		s += "="
+	}
+	return base64.RawURLEncoding.DecodeString(s)
+}
+
 // updateRulesPeriodically updates rules periodically
 func (s *DNSServer) updateRulesPeriodically() {
 	ticker := time.NewTicker(1 * time.Hour)
@@ -437,6 +650,39 @@ func (s *DNSServer) Start() error {
 	go s.updateRulesPeriodically()
 
 	return s.server.ListenAndServe()
+}
+
+// StartDoH starts the DoH server
+func (s *DNSServer) StartDoH() error {
+	cfg := s.config.General
+	s.dohPort = cfg.DohPort
+	s.dohHTTPS = cfg.DohHTTPS
+	s.certCacheDir = cfg.CertCacheDir
+	s.domain = cfg.Domain
+
+	if s.dohPort == 0 {
+		s.dohPort = 8080 // Default to 8080 if not set
+	}
+
+	http.HandleFunc("/dns-query", s.handleDoHRequest)
+
+	if s.dohHTTPS {
+		manager := &autocert.Manager{
+			Cache:      autocert.DirCache(s.certCacheDir),
+			Prompt:     autocert.AcceptTOS,
+			HostPolicy: autocert.HostWhitelist(s.domain),
+		}
+		server := &http.Server{
+			Addr:      fmt.Sprintf(":%d", s.dohPort),
+			Handler:   nil,
+			TLSConfig: manager.TLSConfig(),
+		}
+		s.logger.Printf("DoH HTTPS server started at https://%s/dns-query", fmt.Sprintf(":%d", s.dohPort))
+		return server.ListenAndServeTLS("", "")
+	} else {
+		s.logger.Printf("DoH HTTP server started at http://%s/dns-query", fmt.Sprintf(":%d", s.dohPort))
+		return http.ListenAndServe(fmt.Sprintf(":%d", s.dohPort), nil)
+	}
 }
 
 // Stop stops the DNS server
@@ -478,10 +724,10 @@ func main() {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-	// Start server in a goroutine
+	// Start DoH server in a goroutine
 	go func() {
-		if err := server.Start(); err != nil {
-			log.Fatalf("DNS server error: %v", err)
+		if err := server.StartDoH(); err != nil {
+			log.Fatalf("DoH server error: %v", err)
 		}
 	}()
 
